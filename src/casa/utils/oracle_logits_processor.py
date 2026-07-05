@@ -5,35 +5,39 @@ from typing import Optional
 from transformers.generation.logits_process import LogitsProcessor
 
 from casa.utils.oracle_trie import Trie
+from casa.utils.chopchop_adapter import check_tokens_realizable
 
 
 class OracleLogitsProcessor(LogitsProcessor):
     """Logits processor that enforces grammar constraints using an oracle trie.
-    
+
     This processor maintains a trie structure to track previously sampled sequences
     and their probabilities, enabling adaptive rejection sampling with grammar constraints.
-    
+
     Args:
         tokenizer: The tokenizer associated with the model.
         grammar_constraint: Grammar constraint object from xgrammar.
         device: Device to run computations on.
         learn_level: Learning level (1-3) controlling constraint application.
         constrain_first: Whether to constrain the first token.
+        debug: Whether to print debug information about token validation.
     """
-    
+
     def __init__(
         self,
         tokenizer,
         grammar_constraint,
         device: torch.device,
         learn_level: int = 3,
-        constrain_first: bool = False
+        constrain_first: bool = False,
+        debug: bool = False
     ):
         self.tokenizer = tokenizer
         self.grammar_constraint = grammar_constraint
         self.learn_level = learn_level
         self.constrain_first = constrain_first
         self.device = device
+        self.debug = debug
         
         self.oracle_trie = Trie()
         self.current_index: Optional[int] = None
@@ -70,8 +74,28 @@ class OracleLogitsProcessor(LogitsProcessor):
         
         # Advance the parser (unless we want to sample a full incorrect sample, in level 1)
         if self.learn_level != 1:
+            if self.debug and len(self.generated_tokens) > 0:
+                decoded = self.tokenizer.decode(self.generated_tokens)
+                print(f"[CHECK] tokens={self.generated_tokens.tolist()}, decoded='{decoded}'")
+
+            # First advance the parser (this maintains state for filter_vocab)
             if not self.grammar_constraint.try_advance_token_ids(self.generated_tokens):
+                if self.debug:
+                    print(f"  ✗ Parser rejected")
                 self._generation_failed()
+
+            # Only check realizability if parser advancement succeeded
+            if not check_tokens_realizable(self.generated_tokens, self.tokenizer, self.grammar_constraint):
+                if self.debug:
+                    print(f"  ✗ ChopChop realizability check failed")
+                self._generation_failed()
+            elif self.debug:
+                print(f"  ✓ Both checks passed")
+
+            # Original CASA approach
+            #if not is_root:
+                #if not self.grammar_constraint.try_advance_token_ids(self.generated_tokens):
+                 #   self._generation_failed()
         
         # Enter appropriate trie node (possibly creating it)
         if not is_root:
@@ -118,8 +142,10 @@ class OracleLogitsProcessor(LogitsProcessor):
         if self.learn_level >= 1:
             self.oracle_node.log_theta[0, self.generated_tokens[-1]] = -float('inf')
             self._recompute_in_trie()
-        
-        raise ValueError(f"Generation failed at tokens: {self.generated_tokens}")
+
+        # Decode the failed tokens for debugging
+        failed_text = self.tokenizer.decode(self.generated_tokens)
+        raise ValueError(f"Generation failed at tokens: {self.generated_tokens}\nFailed text: {failed_text}")
     
     def _recompute_in_trie(self) -> None:
         """Recompute log_theta values up the trie after a constraint violation."""
@@ -148,10 +174,29 @@ class OracleLogitsProcessor(LogitsProcessor):
         """
         self._set_generated_tokens(input_ids)
         assert len(self.generated_tokens) == self.oracle_node_depth + 1
-        
+
+        if self.debug:
+            decoded = self.tokenizer.decode(self.generated_tokens)
+            print(f"[GENERATION_ENDED] tokens={self.generated_tokens.tolist()}, decoded='{decoded}'")
+
         # Advance the parser
         if not self.grammar_constraint.try_advance_token_ids(self.generated_tokens):
+            if self.debug:
+                print(f"  ✗ Parser rejected at generation end")
             self._generation_failed()
+
+        # Only check realizability if parser advancement succeeded
+        # Exclude EOS token from realizability check
+        tokens_without_eos = self.generated_tokens
+        if len(self.generated_tokens) > 0 and self.generated_tokens[-1] == self.tokenizer.eos_token_id:
+            tokens_without_eos = self.generated_tokens[:-1]
+
+        if not check_tokens_realizable(tokens_without_eos, self.tokenizer, self.grammar_constraint):
+            if self.debug:
+                print(f"  ✗ ChopChop realizability check failed at generation end")
+            self._generation_failed()
+        elif self.debug:
+            print(f"  ✓ Generation accepted!")
         
         # Check for proper termination
         if self.generated_tokens[-1] != self.tokenizer.eos_token_id:
